@@ -1,0 +1,10 @@
+# Archivos de dependencias
+node_modules/
+venv/
+__pycache__/
+.venv/
+# Archivos de entorno
+.env
+*.csv
+*.json
+SampleMoviePosters/
