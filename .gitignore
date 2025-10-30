@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 # Archivos de entorno
 .env
+*.npz
 *.csv
 *.json
 SampleMoviePosters/
