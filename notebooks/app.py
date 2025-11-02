@@ -1,4 +1,3 @@
-# app.py
 import os
 import re
 import cv2
@@ -205,6 +204,12 @@ def get_poster_source(row: dict) -> str:
     # 4) Fallback
     return PLACEHOLDER
 
+# --- helper robusto de géneros ---
+def _genres_set(s):
+    if pd.isna(s):
+        return set()
+    return set([g.strip() for g in str(s).split('|') if g.strip()])
+
 # ==========================
 # CARGA DE DATOS
 # ==========================
@@ -265,15 +270,18 @@ def extract_features_from_image(image: Image.Image):
 # ==========================
 # LÓGICA DE RECOMENDACIONES
 # ==========================
-def find_similar_movies(df, feature_cols, query_features, top_k=10):
-    """Estandariza X y la query, luego usa cosine similarity."""
-    X = df[feature_cols].values
+def find_similar_movies(df_for_similarity, feature_cols, query_features, top_k=10):
+    """
+    Estandariza X del universo candidato y la query, luego usa cosine similarity.
+    df_for_similarity es el universo sobre el que se hace el top-k.
+    """
+    X = df_for_similarity[feature_cols].values
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     query_scaled = scaler.transform(query_features.reshape(1, -1))
     similarities = cosine_similarity(query_scaled, X_scaled)[0]
     top_indices = np.argsort(similarities)[-top_k:][::-1]
-    results = df.iloc[top_indices].copy()
+    results = df_for_similarity.iloc[top_indices].copy()
     results['similarity'] = similarities[top_indices]
     return results
 
@@ -442,40 +450,92 @@ def main():
         st.markdown('<div class="sub-header">Buscar Películas Similares</div>', unsafe_allow_html=True)
         col1, col2 = st.columns([1, 1])
 
+        # ------------ CAMBIOS AQUÍ (búsqueda por teclado, multi-selección y previsualización) ------------
         with col1:
             st.markdown("#### Opción 1: Seleccionar de la Base de Datos")
+
+            # 1) filtro por cluster
             filter_cluster = st.checkbox("Filtrar por cluster específico")
             if filter_cluster:
                 selected_cluster = st.selectbox("Selecciona un cluster", sorted(df['cluster'].unique()))
-                search_df = df[df['cluster'] == selected_cluster]
+                search_df = df[df['cluster'] == selected_cluster].copy()
             else:
-                search_df = df
+                search_df = df.copy()
 
-            if 'title' in df.columns and df['title'].notna().any():
-                movie_options = search_df['title'].dropna().tolist()
-                selected_movie = st.selectbox("Selecciona una película", movie_options)
-                if st.button("Buscar Similares", key="btn_search_db"):
-                    movie_data = df[df['title'] == selected_movie].iloc[0]
-                    query_features = movie_data[feature_cols].values
-                    with st.spinner("Buscando películas similares..."):
-                        similar_movies = find_similar_movies(df, feature_cols, query_features, top_k=10)
-                    st.success(f"Se encontraron {len(similar_movies)} películas similares")
-                    st.markdown("### Películas Similares")
-                    for _, movie in similar_movies.iterrows():
-                        with st.container():
-                            st.markdown('<div class="movie-card">', unsafe_allow_html=True)
-                            display_movie_card(movie, show_similarity=True)
-                            st.markdown('</div>', unsafe_allow_html=True)
+            # 2) filtro por género (previo a similitud)
+            genre_filter_on = st.checkbox("Filtrar también por género", value=False)
+            selected_genres_sim = []
+            if genre_filter_on and ('genres' in df.columns and df['genres'].notna().any()):
+                all_genres = df['genres'].str.split('|').explode().dropna().unique()
+                selected_genres_sim = st.multiselect("Géneros a incluir", options=sorted(all_genres))
+                if selected_genres_sim:
+                    genre_set = set(selected_genres_sim)
+                    search_df = search_df[search_df['genres'].apply(lambda s: len(_genres_set(s) & genre_set) > 0)]
+                    if len(search_df) == 0:
+                        st.warning("No hay películas que cumplan el/los géneros seleccionados.")
+                        st.stop()
+
+            # 3) búsqueda por teclado + selección simple o múltiple
+            st.markdown("##### Buscar por título (teclea para filtrar)")
+            all_titles = search_df['title'].dropna().astype(str).tolist() if 'title' in search_df.columns else []
+            text_query = st.text_input("Escribe parte del título", placeholder="p. ej., 'matrix', 'toy story'").strip()
+            filtered_titles = [t for t in all_titles if text_query.lower() in t.lower()] if text_query else all_titles
+
+            multi_mode = st.checkbox("Usar varias películas como consulta (promedio de features)", value=False)
+            if multi_mode:
+                selected_movies = st.multiselect("Elige hasta 3 películas", options=filtered_titles)
+                if len(selected_movies) > 3:
+                    st.info("Se tomarán solo las 3 primeras seleccionadas.")
+                    selected_movies = selected_movies[:3]
+                has_selection = len(selected_movies) > 0
             else:
-                movie_ids = search_df.index.tolist()
-                selected_id = st.selectbox("Selecciona ID de película", movie_ids)
-                if st.button("Buscar Similares", key="btn_search_db_id"):
-                    query_features = df.iloc[selected_id][feature_cols].values
-                    with st.spinner("Buscando películas similares..."):
-                        similar_movies = find_similar_movies(df, feature_cols, query_features, top_k=10)
-                    st.success(f"Se encontraron {len(similar_movies)} películas similares")
-                    for _, movie in similar_movies.iterrows():
+                selected_movie = st.selectbox("Selecciona una película", filtered_titles)
+                selected_movies = [selected_movie] if selected_movie else []
+                has_selection = bool(selected_movie)
+
+            # 4) Previsualización de la(s) película(s) base con póster
+            if has_selection:
+                st.markdown("### Película(s) base")
+                cols_prev = st.columns(min(3, len(selected_movies)))
+                for i, title in enumerate(selected_movies):
+                    mrow = df[df['title'] == title].iloc[0]
+                    with cols_prev[i % len(cols_prev)]:
+                        st.markdown('<div class="movie-card">', unsafe_allow_html=True)
+                        display_movie_card(mrow, show_similarity=False)
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+            # 5) Buscar similares (usa el universo candidato filtrado arriba)
+            if st.button("Buscar Similares", key="btn_search_db"):
+                if not has_selection:
+                    st.warning("Selecciona al menos una película.")
+                    st.stop()
+
+                candidate_df = search_df.copy()
+
+                # Vector de consulta: promedio de features si hay varias
+                base_rows = df[df['title'].isin(selected_movies)]
+                query_matrix = base_rows[feature_cols].values
+                query_features = query_matrix.mean(axis=0)
+
+                # Excluir del resultado las películas base (si hay movieId)
+                if 'movieId' in candidate_df.columns and 'movieId' in base_rows.columns:
+                    base_ids = set(base_rows['movieId'].tolist())
+                    candidate_df = candidate_df[~candidate_df['movieId'].isin(base_ids)]
+
+                with st.spinner("Buscando películas similares..."):
+                    similar_movies = find_similar_movies(
+                        candidate_df, feature_cols, query_features, top_k=min(50, len(candidate_df))
+                    )
+
+                similar_movies = similar_movies.head(10)
+                st.success(f"Se encontraron {len(similar_movies)} películas similares")
+                st.markdown("### Películas Similares")
+                for _, movie in similar_movies.iterrows():
+                    with st.container():
+                        st.markdown('<div class="movie-card">', unsafe_allow_html=True)
                         display_movie_card(movie, show_similarity=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+        # ------------ FIN DE CAMBIOS ------------
 
         with col2:
             st.markdown("####  Opción 2: Subir una Imagen")
@@ -606,8 +666,8 @@ def main():
         if year_range and 'year' in filtered_df.columns:
             filtered_df = filtered_df[(filtered_df['year'] >= year_range[0]) & (filtered_df['year'] <= year_range[1])]
         if selected_genres and 'genres' in filtered_df.columns:
-            mask = filtered_df['genres'].apply(lambda x: any(g in str(x) for g in selected_genres))
-            filtered_df = filtered_df[mask]
+            gset = set(selected_genres)
+            filtered_df = filtered_df[filtered_df['genres'].apply(lambda s: len(_genres_set(s) & gset) > 0)]
 
         st.markdown("---")
         st.markdown(f"### Resultados: {len(filtered_df)} películas encontradas")
