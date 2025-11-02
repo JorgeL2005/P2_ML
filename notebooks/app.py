@@ -1,14 +1,21 @@
-import streamlit as st
-import pandas as pd
+# app.py
+import os
+import re
+import cv2
+import unicodedata
 import numpy as np
+import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import StandardScaler
-import io
+from pathlib import Path
 from PIL import Image
-import cv2
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import cosine_similarity
 
+# ==========================
+# CONFIGURACIÓN DE LA APP
+# ==========================
 st.set_page_config(
     page_title="Movie Recommender System",
     page_icon="🎬",
@@ -16,7 +23,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS personalizado para mejorar la apariencia
+# ==========================
+# ESTILOS
+# ==========================
 st.markdown("""
 <style>
     .main-header {
@@ -35,14 +44,6 @@ st.markdown("""
         margin-top: 2rem;
         margin-bottom: 1rem;
     }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
     .cluster-badge {
         display: inline-block;
         padding: 0.3rem 0.8rem;
@@ -50,6 +51,7 @@ st.markdown("""
         font-weight: 600;
         font-size: 0.9rem;
         margin: 0.2rem;
+        color: white;
     }
     .movie-card {
         border: 2px solid #e0e0e0;
@@ -64,63 +66,207 @@ st.markdown("""
         border-color: #667eea;
         transform: translateY(-5px);
     }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2rem;
-    }
-    .stTabs [data-baseweb="tab"] {
-        padding: 1rem 2rem;
-        font-weight: 600;
-    }
+    .stTabs [data-baseweb="tab-list"] { gap: 2rem; }
+    .stTabs [data-baseweb="tab"] { padding: 1rem 2rem; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
-@st.cache_data
-def load_data():
+# ==========================
+# DIAGNÓSTICO (siempre visible)
+# ==========================
+with st.sidebar.expander("🔧 Diagnóstico (click para abrir)", expanded=True):
+    st.write("**Working dir**:", os.getcwd())
     try:
-        df_pca = pd.read_csv('pca_features_clustered.csv')
-        df_umap = pd.read_csv('umap_features_clustered.csv')
-
-        if 'cluster' in df_pca.columns:
-            df = df_pca
-            method = 'PCA'
-        elif 'cluster' in df_umap.columns:
-            df = df_umap
-            method = 'UMAP'
+        files = os.listdir()
+        st.write("**Archivos en la carpeta**:", files)
+        found = []
+        for fname in [
+            "combined_features_clustered.csv",
+            "pca_features_clustered.csv",
+            "umap_features_clustered.csv",
+        ]:
+            if os.path.exists(fname):
+                found.append(fname)
+        if found:
+            st.success(f"Encontrado(s): {found}")
         else:
-            st.error("No se encontró la columna 'cluster' en los archivos")
-            return None, None, None
-    except FileNotFoundError:
-        st.error("No se encontraron los archivos clusterizados. Ejecuta el script de K-means primero.")
-        return None, None, None
+            st.error("No se encontró ningún archivo *_clustered.csv")
+            st.info("Coloca junto a app.py alguno de: "
+                    "`combined_features_clustered.csv`, "
+                    "`pca_features_clustered.csv`, "
+                    "`umap_features_clustered.csv`.")
+    except Exception as e:
+        st.error(f"Error listando archivos: {e}")
+
+# ==========================
+# CONSTANTES / UTILS
+# ==========================
+PLACEHOLDER = "https://via.placeholder.com/150x225/667eea/ffffff?text=Movie+Poster"
+POSTER_FOLDER = "Posterss"  # Carpeta local con pósters
+
+def _slugify(text: str) -> str:
+    text = re.sub(r"[^\w\s-]", "", str(text)).strip().lower()
+    return re.sub(r"[\s_-]+", "-", text)
+
+def _ascii(text: str) -> str:
+    return unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii")
+
+def _is_valid_http_url(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    s = s.strip()
+    if not s or s.lower() in {"none", "nan", "null", "0", "-", "na"}:
+        return False
+    return s.startswith("http://") or s.startswith("https://")
+
+def _is_tmdb_path(s: str) -> bool:
+    return isinstance(s, str) and s.strip().startswith("/") and s.strip().lower().endswith((".jpg", ".png", ".jpeg"))
+
+def _first_existing(paths):
+    for p in paths:
+        if Path(p).exists():
+            return str(p)
+    return None
+
+@st.cache_data(show_spinner=False)
+def _poster_index():
+    """Indexa una vez los archivos de Posterss para búsqueda flexible."""
+    base = Path(__file__).resolve().parent / POSTER_FOLDER
+    files = []
+    if base.exists():
+        for p in base.iterdir():
+            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                files.append(p)
+    names_ci = [p.stem.casefold() for p in files]
+    return base, files, names_ci
+
+def get_poster_source(row: dict) -> str:
+    """
+    Prioridad:
+    1) URL directa (poster_url, image_url)
+    2) TMDb poster_path -> URL
+    3) Archivo local en Posterss/ probando: movieId, título EXACTO, ASCII, slug y búsqueda contains.
+    4) Placeholder
+    """
+    # 1) URLs directas
+    for col in ("poster_url", "image_url"):
+        if col in row and _is_valid_http_url(row[col]):
+            return row[col].strip()
+
+    # 2) TMDb path
+    if "poster_path" in row and _is_tmdb_path(row["poster_path"]):
+        return f"https://image.tmdb.org/t/p/w342{row['poster_path'].strip()}"
+
+    # 3) Local
+    base, files, names_ci = _poster_index()
+    if not base.exists():
+        return PLACEHOLDER
+
+    # 3.a) por movieId
+    if "movieId" in row and pd.notna(row["movieId"]):
+        try:
+            mid = int(row["movieId"])
+            hit = _first_existing([base / f"{mid}{ext}" for ext in (".jpg", ".png", ".jpeg")])
+            if hit:
+                return hit
+        except Exception:
+            pass
+
+    # 3.b) por título (varias estrategias)
+    title = None
+    if "title" in row and pd.notna(row["title"]):
+        title = str(row["title"]).strip()
+
+    if title:
+        # EXACTO
+        hit = _first_existing([base / f"{title}{ext}" for ext in (".jpg", ".png", ".jpeg")])
+        if hit:
+            return hit
+
+        # ASCII
+        title_ascii = _ascii(title)
+        hit = _first_existing([base / f"{title_ascii}{ext}" for ext in (".jpg", ".png", ".jpeg")])
+        if hit:
+            return hit
+
+        # SLUG
+        title_slug = _slugify(title)
+        hit = _first_existing([base / f"{title_slug}{ext}" for ext in (".jpg", ".png", ".jpeg")])
+        if hit:
+            return hit
+
+        # CONTAINS (case-insensitive, sin tildes)
+        q = _ascii(title).casefold()
+        candidates = [(len(n), i) for i, n in enumerate(names_ci) if q in _ascii(n).casefold()]
+        if candidates:
+            _, best_i = max(candidates)  # prioriza coincidencia más larga
+            return str(files[best_i])
+
+    # 4) Fallback
+    return PLACEHOLDER
+
+# ==========================
+# CARGA DE DATOS
+# ==========================
+@st.cache_data(show_spinner=False)
+def load_movie_metadata():
+    """Intenta cargar metadatos opcionales."""
+    for candidate in ["movies_train.csv", "movies.csv", "metadata.csv"]:
+        if os.path.exists(candidate):
+            try:
+                md = pd.read_csv(candidate)
+                return md
+            except Exception:
+                pass
+    return None
+
+@st.cache_data(show_spinner=False)
+def load_clustered_data():
+    """Carga el dataset clusterizado disponible y devuelve df, feature_cols, método, archivo."""
+    candidates = [
+        ("combined_features_clustered.csv", "COMBINED"),
+        ("pca_features_clustered.csv", "PCA"),
+        ("umap_features_clustered.csv", "UMAP"),
+    ]
+    chosen = None
+    for fname, method in candidates:
+        if os.path.exists(fname):
+            chosen = (fname, method)
+            break
+
+    if chosen is None:
+        return None, None, None, None
+
+    df = pd.read_csv(chosen[0])
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    feature_cols = [col for col in numeric_cols if col not in ['cluster', 'movieId', 'id', 'index', 'year']]
-    return df, feature_cols, method
+    exclude = {'cluster', 'movieId', 'id', 'index', 'year'}
+    feature_cols = [c for c in numeric_cols if c not in exclude]
 
-@st.cache_data
-def load_movie_metadata():
-    try:
-        metadata = pd.read_csv('movies_train.csv')
-        return metadata
-    except:
-        return None
+    if 'cluster' not in df.columns:
+        return None, None, None, chosen[0]
 
-def extract_features_from_image(image):
-    img_array = np.array(image)
+    return df, feature_cols, chosen[1], chosen[0]
+
+# ==========================
+# EXTRACCIÓN DE FEATURES (IMAGEN SUBIDA) - DEMO
+# ==========================
+def extract_features_from_image(image: Image.Image):
+    """DEMO simple: histograma RGB + stats (para producción replica tu pipeline real)."""
+    img_array = np.array(image.convert("RGB"))
     img_resized = cv2.resize(img_array, (100, 150))
     features = []
     for channel in range(3):
         hist = cv2.calcHist([img_resized], [channel], None, [32], [0, 256])
         features.extend(hist.flatten())
-    features.extend([
-        img_resized.mean(),
-        img_resized.std(),
-        img_resized.min(),
-        img_resized.max()
-    ])
-    return np.array(features)
+    features.extend([img_resized.mean(), img_resized.std(), img_resized.min(), img_resized.max()])
+    return np.array(features, dtype=float)
 
+# ==========================
+# LÓGICA DE RECOMENDACIONES
+# ==========================
 def find_similar_movies(df, feature_cols, query_features, top_k=10):
+    """Estandariza X y la query, luego usa cosine similarity."""
     X = df[feature_cols].values
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -132,7 +278,7 @@ def find_similar_movies(df, feature_cols, query_features, top_k=10):
     return results
 
 def get_cluster_representatives(df, feature_cols, n_per_cluster=5):
-    representatives = []
+    reps = []
     for cluster_id in sorted(df['cluster'].unique()):
         cluster_data = df[df['cluster'] == cluster_id]
         centroid = cluster_data[feature_cols].mean().values
@@ -140,34 +286,32 @@ def get_cluster_representatives(df, feature_cols, n_per_cluster=5):
         closest_indices = np.argsort(distances)[:n_per_cluster]
         cluster_reps = cluster_data.iloc[closest_indices].copy()
         cluster_reps['distance_to_centroid'] = distances[closest_indices]
-        representatives.append(cluster_reps)
-    return pd.concat(representatives, ignore_index=True)
+        reps.append(cluster_reps)
+    return pd.concat(reps, ignore_index=True) if reps else pd.DataFrame(columns=list(df.columns)+['distance_to_centroid'])
 
+# ==========================
+# PLOTS
+# ==========================
 def plot_clusters_interactive(df, feature_cols, color_by='cluster'):
     plot_data = df.copy()
     plot_data['x'] = df[feature_cols[0]]
     plot_data['y'] = df[feature_cols[1]]
 
     hover_cols = ['x', 'y', 'cluster']
-    if 'title' in df.columns:
-        hover_cols.append('title')
-    if 'genres' in df.columns:
-        hover_cols.append('genres')
-    if 'year' in df.columns:
-        hover_cols.append('year')
+    for c in ['title', 'genres', 'year', 'movieId']:
+        if c in df.columns:
+            hover_cols.append(c)
 
     fig = px.scatter(
         plot_data,
-        x='x',
-        y='y',
+        x='x', y='y',
         color=color_by,
         hover_data=hover_cols,
         title='Distribución de Películas en Espacio de Características',
-        color_continuous_scale='viridis' if color_by != 'cluster' else None,
         height=600,
         labels={'x': 'Componente 1', 'y': 'Componente 2'}
     )
-    fig.update_traces(marker=dict(size=8, opacity=0.7, line=dict(width=0.5, color='white')))
+    fig.update_traces(marker=dict(size=8, opacity=0.75, line=dict(width=0.5, color='white')))
     fig.update_layout(
         plot_bgcolor='rgba(240, 242, 246, 0.5)',
         paper_bgcolor='white',
@@ -177,14 +321,14 @@ def plot_clusters_interactive(df, feature_cols, color_by='cluster'):
     return fig
 
 def plot_cluster_distribution(df):
-    cluster_counts = df['cluster'].value_counts().sort_index()
-    colors = px.colors.qualitative.Set3[:len(cluster_counts)]
+    counts = df['cluster'].value_counts().sort_index()
+    colors = (px.colors.qualitative.Set3 * ((len(counts) // 10) + 1))[:len(counts)]
     fig = go.Figure(data=[
         go.Bar(
-            x=[f'Cluster {i}' for i in cluster_counts.index],
-            y=cluster_counts.values,
+            x=[f'Cluster {i}' for i in counts.index],
+            y=counts.values,
             marker_color=colors,
-            text=cluster_counts.values,
+            text=counts.values,
             textposition='auto',
         )
     ])
@@ -199,59 +343,92 @@ def plot_cluster_distribution(df):
     )
     return fig
 
+# ==========================
+# UI DE PELÍCULA
+# ==========================
 def display_movie_card(movie_data, show_similarity=False):
     col1, col2 = st.columns([1, 3])
     with col1:
-        st.image("https://via.placeholder.com/150x225/667eea/white?text=Movie+Poster",
-                 use_container_width=True)
+        img_src = get_poster_source(movie_data)
+        st.image(img_src, use_container_width=True)
     with col2:
         title = movie_data.get('title', f"Movie ID: {movie_data.get('movieId', 'Unknown')}")
         st.markdown(f"**{title}**")
-        cluster_color = px.colors.qualitative.Set3[int(movie_data['cluster']) % 10]
+        palette = px.colors.qualitative.Set3
+        color = palette[int(movie_data['cluster']) % len(palette)]
         st.markdown(
-            f'<span class="cluster-badge" style="background-color: {cluster_color};">'
-            f'Cluster {int(movie_data["cluster"])}</span>',
+            f'<span class="cluster-badge" style="background-color: {color};">Cluster {int(movie_data["cluster"])}</span>',
             unsafe_allow_html=True
         )
         info_cols = st.columns(3)
-        if 'genres' in movie_data:
-            info_cols[0].write(f" {movie_data['genres']}")
-        if 'year' in movie_data:
-            info_cols[1].write(f" {movie_data['year']}")
+        if 'genres' in movie_data and pd.notna(movie_data['genres']):
+            info_cols[0].write(f"{movie_data['genres']}")
+        if 'year' in movie_data and pd.notna(movie_data['year']):
+            try:
+                info_cols[1].write(f"Año: {int(movie_data['year'])}")
+            except Exception:
+                info_cols[1].write(f"Año: {movie_data['year']}")
         if show_similarity and 'similarity' in movie_data:
-            info_cols[2].write(f" Similitud: {movie_data['similarity']:.2%}")
+            info_cols[2].write(f"Similitud: {movie_data['similarity']:.2%}")
 
+# ==========================
+# APP
+# ==========================
 def main():
-    st.markdown('<h1 class="main-header"> Sistema de Recomendación de Películas</h1>',
-                unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">Sistema de Recomendación de Películas</h1>', unsafe_allow_html=True)
     st.markdown("---")
 
-    df, feature_cols, method = load_data()
-    metadata = load_movie_metadata()
+    df, feature_cols, method, chosen_file = load_clustered_data()
     if df is None:
-        st.stop()
+        st.warning("""
+        ⚠️ No se pudieron cargar datasets clusterizados válidos.
+        Asegúrate de tener alguno de estos archivos junto a `app.py` **con columna `cluster`**:
+        - `combined_features_clustered.csv`
+        - `pca_features_clustered.csv`
+        - `umap_features_clustered.csv`
+        """)
+        if chosen_file:
+            st.error(f"Se intentó usar `{chosen_file}`, pero no tiene columna `cluster`.")
+        return
 
-    # Combinar con metadatos si están disponibles
-    if metadata is not None:
-        if 'movieId' in df.columns and 'movieId' in metadata.columns:
-            df = df.merge(metadata[['movieId', 'title', 'genres']], on='movieId', how='left')
+    metadata = load_movie_metadata()
+    if metadata is not None and 'movieId' in df.columns and 'movieId' in metadata.columns:
+        keep_cols = ['movieId', 'title', 'genres']
+        if 'poster_url' in metadata.columns:
+            keep_cols.append('poster_url')
+        if 'poster_path' in metadata.columns:
+            keep_cols.append('poster_path')
+        if 'year' in metadata.columns:
+            keep_cols.append('year')
+        df = df.merge(metadata[keep_cols], on='movieId', how='left')
 
-    # Sidebar
+    # ===== Sidebar extra: Diagnóstico de pósters =====
+    with st.sidebar.expander("🖼️ Diagnóstico de pósters", expanded=False):
+        try:
+            base, files, _ = _poster_index()
+            st.write(f"Carpeta de pósters: {base}")
+            st.write(f"Total archivos detectados: {len(files)}")
+            if 'title' in df.columns and df['title'].notna().any():
+                sample_title = st.selectbox("Probar con este título", df['title'].dropna().head(2000).unique())
+                row = df[df['title'] == sample_title].iloc[0].to_dict()
+                path = get_poster_source(row)
+                st.caption(f"Ruta/URL resuelta: {path}")
+                st.image(path, caption="Vista previa", use_container_width=True)
+        except Exception as e:
+            st.error(f"Diagnóstico falló: {e}")
+
+    # ===== Sidebar =====
     with st.sidebar:
-        st.image("https://via.placeholder.com/300x100/667eea/white?text=Movie+Recommender",
-                 use_container_width=True)
+        st.image("https://via.placeholder.com/300x100/667eea/ffffff?text=Movie+Recommender", use_container_width=True)
         st.markdown("---")
         st.markdown("### Estadísticas del Dataset")
         st.metric("Total de Películas", len(df))
-        st.metric("Número de Clusters", df['cluster'].nunique())
+        st.metric("Número de Clusters", int(df['cluster'].nunique()))
         st.metric("Método de Reducción", method)
         st.metric("Dimensiones de Features", len(feature_cols))
+        st.metric("Fuente de datos", chosen_file if chosen_file else "—")
         st.markdown("---")
-        st.markdown("### Información")
-        st.info("""
-        Este sistema agrupa películas basándose en características visuales 
-        extraídas de sus pósters usando técnicas de clustering.
-        """)
+        st.info("Este sistema agrupa películas basándose en características visuales extraídas de sus pósters usando técnicas de clustering.")
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "Búsqueda por Similitud",
@@ -260,59 +437,49 @@ def main():
         "Filtros Avanzados"
     ])
 
+    # ===== Tab 1: Búsqueda por Similitud =====
     with tab1:
-        st.markdown('<div class="sub-header">Buscar Películas Similares</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Buscar Películas Similares</div>', unsafe_allow_html=True)
         col1, col2 = st.columns([1, 1])
 
         with col1:
-            st.markdown("####Opción 1: Seleccionar de la Base de Datos")
+            st.markdown("#### Opción 1: Seleccionar de la Base de Datos")
             filter_cluster = st.checkbox("Filtrar por cluster específico")
             if filter_cluster:
-                selected_cluster = st.selectbox(
-                    "Selecciona un cluster",
-                    sorted(df['cluster'].unique())
-                )
+                selected_cluster = st.selectbox("Selecciona un cluster", sorted(df['cluster'].unique()))
                 search_df = df[df['cluster'] == selected_cluster]
             else:
                 search_df = df
 
-            if 'title' in df.columns:
+            if 'title' in df.columns and df['title'].notna().any():
                 movie_options = search_df['title'].dropna().tolist()
-                if movie_options:
-                    selected_movie = st.selectbox("Selecciona una película", movie_options)
-                    if st.button("Buscar Similares", key="search_db"):
-                        movie_data = df[df['title'] == selected_movie].iloc[0]
-                        query_features = movie_data[feature_cols].values
-                        with st.spinner("Buscando películas similares..."):
-                            similar_movies = find_similar_movies(
-                                df, feature_cols, query_features, top_k=10
-                            )
-                        st.success(f"Se encontraron {len(similar_movies)} películas similares")
-                        st.markdown("### Películas Similares")
-                        for idx, movie in similar_movies.iterrows():
-                            with st.container():
-                                st.markdown('<div class="movie-card">', unsafe_allow_html=True)
-                                display_movie_card(movie, show_similarity=True)
-                                st.markdown('</div>', unsafe_allow_html=True)
-                else:
-                    st.warning("No hay películas con títulos disponibles")
+                selected_movie = st.selectbox("Selecciona una película", movie_options)
+                if st.button("Buscar Similares", key="btn_search_db"):
+                    movie_data = df[df['title'] == selected_movie].iloc[0]
+                    query_features = movie_data[feature_cols].values
+                    with st.spinner("Buscando películas similares..."):
+                        similar_movies = find_similar_movies(df, feature_cols, query_features, top_k=10)
+                    st.success(f"Se encontraron {len(similar_movies)} películas similares")
+                    st.markdown("### Películas Similares")
+                    for _, movie in similar_movies.iterrows():
+                        with st.container():
+                            st.markdown('<div class="movie-card">', unsafe_allow_html=True)
+                            display_movie_card(movie, show_similarity=True)
+                            st.markdown('</div>', unsafe_allow_html=True)
             else:
                 movie_ids = search_df.index.tolist()
                 selected_id = st.selectbox("Selecciona ID de película", movie_ids)
-                if st.button("Buscar Similares", key="search_db_id"):
+                if st.button("Buscar Similares", key="btn_search_db_id"):
                     query_features = df.iloc[selected_id][feature_cols].values
                     with st.spinner("Buscando películas similares..."):
-                        similar_movies = find_similar_movies(
-                            df, feature_cols, query_features, top_k=10
-                        )
-                    st.success(f" Se encontraron {len(similar_movies)} películas similares")
-                    for idx, movie in similar_movies.iterrows():
+                        similar_movies = find_similar_movies(df, feature_cols, query_features, top_k=10)
+                    st.success(f"Se encontraron {len(similar_movies)} películas similares")
+                    for _, movie in similar_movies.iterrows():
                         display_movie_card(movie, show_similarity=True)
 
         with col2:
             st.markdown("####  Opción 2: Subir una Imagen")
-            st.info("⚠️ Funcionalidad en desarrollo: requiere el mismo pipeline de features que el entrenamiento.")
+            st.info("⚠️ DEMO: usa el mismo pipeline de features que tu entrenamiento para resultados reales.")
             uploaded_file = st.file_uploader(
                 "Sube un póster de película",
                 type=['jpg', 'jpeg', 'png'],
@@ -321,56 +488,52 @@ def main():
             if uploaded_file:
                 image = Image.open(uploaded_file)
                 st.image(image, caption="Imagen subida", use_container_width=True)
-                if st.button("Buscar por Imagen"):
-                    st.warning("""
-                    Esta funcionalidad requiere:
-                    1) El modelo de extracción de features entrenado
-                    2) Procesar la imagen con el mismo pipeline usado en el entrenamiento
-                    """)
+                if st.button("Buscar por Imagen", key="btn_search_img"):
+                    st.warning(
+                        "Para recomendaciones reales desde imagen, extrae features con el mismo pipeline del entrenamiento "
+                        "(por ejemplo, embeddings de CLIP/ViT + normalización idéntica) y compara con cosine similarity."
+                    )
 
+    # ===== Tab 2: Clusters y Representantes =====
     with tab2:
-        st.markdown('<div class="sub-header">Explorar Clusters de Películas</div>',
-                    unsafe_allow_html=True)
-
+        st.markdown('<div class="sub-header">Explorar Clusters de Películas</div>', unsafe_allow_html=True)
         col1, col2 = st.columns([2, 1])
+
         with col1:
             fig_dist = plot_cluster_distribution(df)
-            # KEY ÚNICO
             st.plotly_chart(fig_dist, use_container_width=True, key="plot_cluster_dist")
 
         with col2:
             st.markdown("### Estadísticas por Cluster")
             for cluster_id in sorted(df['cluster'].unique()):
-                cluster_size = len(df[df['cluster'] == cluster_id])
-                percentage = (cluster_size / len(df)) * 100
-                st.metric(f"Cluster {cluster_id}", f"{cluster_size} películas", f"{percentage:.1f}%")
+                size = (df['cluster'] == cluster_id).sum()
+                st.metric(f"Cluster {cluster_id}", f"{size} películas", f"{(100*size/len(df)):.1f}%")
 
         st.markdown("---")
         st.markdown("### Películas Representativas de Cada Cluster")
-        n_representatives = st.slider(
-            "Número de representantes por cluster", min_value=3, max_value=10, value=5
-        )
+        n_representatives = st.slider("Número de representantes por cluster", min_value=3, max_value=10, value=5)
         with st.spinner("Calculando películas representativas..."):
             representatives = get_cluster_representatives(df, feature_cols, n_representatives)
 
-        for cluster_id in sorted(representatives['cluster'].unique()):
-            with st.expander(f"🎬 Cluster {cluster_id}", expanded=True):
-                cluster_reps = representatives[representatives['cluster'] == cluster_id]
-                cols = st.columns(min(3, len(cluster_reps)))
-                for idx, (_, movie) in enumerate(cluster_reps.iterrows()):
-                    with cols[idx % 3]:
-                        st.markdown('<div class="movie-card">', unsafe_allow_html=True)
-                        display_movie_card(movie, show_similarity=False)
-                        st.caption(f"Distancia al centroide: {movie['distance_to_centroid']:.3f}")
-                        st.markdown('</div>', unsafe_allow_html=True)
+        if len(representatives) == 0:
+            st.info("No hay representantes para mostrar.")
+        else:
+            for cluster_id in sorted(representatives['cluster'].unique()):
+                with st.expander(f"🎬 Cluster {cluster_id}", expanded=True):
+                    cluster_reps = representatives[representatives['cluster'] == cluster_id]
+                    cols = st.columns(min(3, len(cluster_reps)))
+                    for idx, (_, movie) in enumerate(cluster_reps.iterrows()):
+                        with cols[idx % 3]:
+                            st.markdown('<div class="movie-card">', unsafe_allow_html=True)
+                            display_movie_card(movie, show_similarity=False)
+                            if 'distance_to_centroid' in movie and pd.notna(movie['distance_to_centroid']):
+                                st.caption(f"Distancia al centroide: {movie['distance_to_centroid']:.3f}")
+                            st.markdown('</div>', unsafe_allow_html=True)
 
+    # ===== Tab 3: Visualización 2D =====
     with tab3:
-        st.markdown('<div class="sub-header">Visualización del Espacio de Características</div>',
-                    unsafe_allow_html=True)
-        st.info("""
-        Esta visualización muestra la distribución de películas en un espacio 2D.
-        Películas cercanas tienen características visuales similares.
-        """)
+        st.markdown('<div class="sub-header">Visualización del Espacio de Características</div>', unsafe_allow_html=True)
+        st.info("Esta visualización muestra la distribución de películas en un espacio 2D. Películas cercanas tienen características visuales similares.")
 
         col1, col2 = st.columns([3, 1])
         with col2:
@@ -378,12 +541,7 @@ def main():
             color_option = st.radio("Colorear por:", ["Cluster", "Año (si disponible)", "Género (si disponible)"])
             show_all = st.checkbox("Mostrar todas las películas", value=True)
             if not show_all:
-                sample_size = st.slider(
-                    "Número de películas a mostrar",
-                    min_value=100,
-                    max_value=min(5000, len(df)),
-                    value=min(1000, len(df))
-                )
+                sample_size = st.slider("Número de películas a mostrar", min_value=100, max_value=min(5000, len(df)), value=min(1000, len(df)))
                 plot_df = df.sample(n=sample_size, random_state=42)
             else:
                 plot_df = df
@@ -401,7 +559,6 @@ def main():
                 color_by = 'cluster'
 
             fig_scatter = plot_clusters_interactive(plot_df, feature_cols, color_by)
-            # KEY ÚNICO
             st.plotly_chart(fig_scatter, use_container_width=True, key="plot_scatter_main")
 
         st.markdown("### Análisis Estadístico")
@@ -411,47 +568,45 @@ def main():
         with stat_cols[1]:
             st.metric("Clusters Únicos", plot_df['cluster'].nunique())
         with stat_cols[2]:
-            avg_cluster_size = len(plot_df) / plot_df['cluster'].nunique()
+            avg_cluster_size = len(plot_df) / max(1, plot_df['cluster'].nunique())
             st.metric("Tamaño Promedio de Cluster", f"{avg_cluster_size:.1f}")
         with stat_cols[3]:
             if 'genres' in plot_df.columns:
                 unique_genres = plot_df['genres'].str.split('|').explode().nunique()
                 st.metric("Géneros Únicos", unique_genres)
 
+    # ===== Tab 4: Filtros Avanzados =====
     with tab4:
-        st.markdown('<div class="sub-header">Búsqueda y Filtros Avanzados</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Búsqueda y Filtros Avanzados</div>', unsafe_allow_html=True)
 
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("#### Filtrar por Cluster")
-            selected_clusters = st.multiselect(
-                "Selecciona clusters",
-                options=sorted(df['cluster'].nunique() and df['cluster'].unique()),
-                default=sorted(df['cluster'].unique())
-            )
+            options = sorted(df['cluster'].unique())
+            selected_clusters = st.multiselect("Selecciona clusters", options=options, default=options)
+
         with col2:
-            if 'year' in df.columns:
+            if 'year' in df.columns and df['year'].notna().any():
                 st.markdown("#### Filtrar por Año")
                 min_year = int(df['year'].min()) if pd.notna(df['year'].min()) else 1900
-                max_year = int(df['year'].max()) if pd.notna(df['year'].max()) else 2024
+                max_year = int(df['year'].max()) if pd.notna(df['year'].max()) else 2025
                 year_range = st.slider("Rango de años", min_value=min_year, max_value=max_year, value=(min_year, max_year))
             else:
                 year_range = None
+
         with col3:
-            if 'genres' in df.columns:
+            if 'genres' in df.columns and df['genres'].notna().any():
                 st.markdown("#### Filtrar por Género")
-                all_genres = df['genres'].str.split('|').explode().unique()
-                all_genres = [g for g in all_genres if pd.notna(g)]
+                all_genres = df['genres'].str.split('|').explode().dropna().unique()
                 selected_genres = st.multiselect("Selecciona géneros", options=sorted(all_genres))
             else:
                 selected_genres = []
 
-        filtered_df = df[df['cluster'].isin(selected_clusters)]
-        if year_range and 'year' in df.columns:
+        filtered_df = df[df['cluster'].isin(selected_clusters)].copy()
+        if year_range and 'year' in filtered_df.columns:
             filtered_df = filtered_df[(filtered_df['year'] >= year_range[0]) & (filtered_df['year'] <= year_range[1])]
-        if selected_genres and 'genres' in df.columns:
-            mask = filtered_df['genres'].apply(lambda x: any(genre in str(x) for genre in selected_genres))
+        if selected_genres and 'genres' in filtered_df.columns:
+            mask = filtered_df['genres'].apply(lambda x: any(g in str(x) for g in selected_genres))
             filtered_df = filtered_df[mask]
 
         st.markdown("---")
@@ -462,7 +617,8 @@ def main():
             if view_option == "Lista":
                 n_cols = 3
                 rows = (len(filtered_df) + n_cols - 1) // n_cols
-                for row in range(min(rows, 10)):  # limitar a 10 filas
+                max_rows = min(rows, 10)
+                for row in range(max_rows):
                     cols = st.columns(n_cols)
                     for col_idx in range(n_cols):
                         idx = row * n_cols + col_idx
@@ -473,30 +629,18 @@ def main():
                                 display_movie_card(movie)
                                 st.markdown('</div>', unsafe_allow_html=True)
 
-                if len(filtered_df) > 30:
-                    st.info(f"Mostrando las primeras 30 de {len(filtered_df)} películas")
-
+                if len(filtered_df) > (n_cols * max_rows):
+                    st.info(f"Mostrando las primeras {n_cols * max_rows} de {len(filtered_df)} películas")
             elif view_option == "Tabla":
                 display_cols = ['cluster']
-                if 'title' in filtered_df.columns:
-                    display_cols.append('title')
-                if 'genres' in filtered_df.columns:
-                    display_cols.append('genres')
-                if 'year' in filtered_df.columns:
-                    display_cols.append('year')
-
-                st.dataframe(filtered_df[display_cols].head(100), use_container_width=True, height=400)
-
+                for c in ['title', 'genres', 'year', 'movieId']:
+                    if c in filtered_df.columns:
+                        display_cols.append(c)
+                st.dataframe(filtered_df[display_cols].head(200), use_container_width=True, height=420)
                 csv = filtered_df.to_csv(index=False)
-                st.download_button(
-                    label="Descargar resultados (CSV)",
-                    data=csv,
-                    file_name="peliculas_filtradas.csv",
-                    mime="text/csv"
-                )
-            else:  # Gráfico
+                st.download_button("Descargar resultados (CSV)", data=csv, file_name="peliculas_filtradas.csv", mime="text/csv")
+            else:
                 fig = plot_clusters_interactive(filtered_df, feature_cols, 'cluster')
-                # KEY ÚNICO
                 st.plotly_chart(fig, use_container_width=True, key="plot_filtered_scatter")
         else:
             st.warning("No se encontraron películas con los filtros seleccionados")
@@ -504,8 +648,8 @@ def main():
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666; padding: 2rem;'>
-        <p> Sistema de Recomendación de Películas basado en Clustering Visual</p>
-        <p>Desarrollado con usando Streamlit, Scikit-learn y Plotly</p>
+        <p>Sistema de Recomendación de Películas basado en Clustering Visual</p>
+        <p>Desarrollado con Streamlit, Scikit-learn y Plotly</p>
     </div>
     """, unsafe_allow_html=True)
 
