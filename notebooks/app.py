@@ -229,9 +229,7 @@ def load_movie_metadata():
 def load_clustered_data():
     """Carga el dataset clusterizado disponible y devuelve df, feature_cols, método, archivo."""
     candidates = [
-        ("combined_features_clustered.csv", "COMBINED"),
-        ("pca_features_clustered.csv", "PCA"),
-        ("umap_features_clustered.csv", "UMAP"),
+        ("best_method_clustered.csv", "UMAP"),
     ]
     chosen = None
     for fname, method in candidates:
@@ -298,32 +296,46 @@ def get_cluster_representatives(df, feature_cols, n_per_cluster=5):
     return pd.concat(reps, ignore_index=True) if reps else pd.DataFrame(columns=list(df.columns)+['distance_to_centroid'])
 
 # ==========================
-# PLOTS
+# PLOTS (NUEVOS: ejes con nombres reales)
 # ==========================
-def plot_clusters_interactive(df, feature_cols, color_by='cluster'):
-    plot_data = df.copy()
-    plot_data['x'] = df[feature_cols[0]]
-    plot_data['y'] = df[feature_cols[1]]
+def _pretty_axis(col_name: str) -> str:
+    """Mapa de nombres legibles para ejes."""
+    m = {
+        "year": "Año",
+        "age": "Edad",
+        "runtime": "Duración (min)",
+        "vote_average": "Puntaje",
+        "vote_count": "Nº de votos",
+        "popularity": "Popularidad",
+        "budget": "Presupuesto",
+        "revenue": "Recaudación",
+    }
+    key = str(col_name).lower()
+    if key in m:
+        return m[key]
+    return str(col_name).replace("_", " ").title()
 
-    hover_cols = ['x', 'y', 'cluster']
-    for c in ['title', 'genres', 'year', 'movieId']:
-        if c in df.columns:
-            hover_cols.append(c)
-
+def plot_scatter_by_columns(df, x_col: str, y_col: str, color_by='cluster', title_suffix=''):
     fig = px.scatter(
-        plot_data,
-        x='x', y='y',
+        df,
+        x=x_col,
+        y=y_col,
         color=color_by,
-        hover_data=hover_cols,
-        title='Distribución de Películas en Espacio de Características',
+        hover_data=[c for c in ['title', 'genres', 'year', 'movieId'] if c in df.columns],
+        title=f"Distribución de Películas {f'({title_suffix})' if title_suffix else ''}",
         height=600,
-        labels={'x': 'Componente 1', 'y': 'Componente 2'}
+        labels={x_col: _pretty_axis(x_col), y_col: _pretty_axis(y_col)}
     )
-    fig.update_traces(marker=dict(size=8, opacity=0.75, line=dict(width=0.5, color='white')))
+    fig.update_traces(marker=dict(size=8, opacity=0.80, line=dict(width=0.5, color='white')))
     fig.update_layout(
-        plot_bgcolor='rgba(240, 242, 246, 0.5)',
+        plot_bgcolor='rgba(240, 242, 246, 0.6)',
         paper_bgcolor='white',
-        font=dict(size=12),
+        font=dict(size=14, color='black'),
+        title=dict(font=dict(size=20, color='black')),
+        xaxis=dict(title_font=dict(size=16, color='black'), tickfont=dict(size=12, color='black'),
+                   showgrid=True, gridcolor='lightgray', zeroline=False),
+        yaxis=dict(title_font=dict(size=16, color='black'), tickfont=dict(size=12, color='black'),
+                   showgrid=True, gridcolor='lightgray', zeroline=False),
         hoverlabel=dict(bgcolor="white", font_size=12)
     )
     return fig
@@ -347,7 +359,10 @@ def plot_cluster_distribution(df):
         height=400,
         showlegend=False,
         plot_bgcolor='rgba(240, 242, 246, 0.5)',
-        paper_bgcolor='white'
+        paper_bgcolor='white',
+        font=dict(size=14, color='black'),
+        xaxis=dict(title_font=dict(size=16, color='black'), tickfont=dict(size=12, color='black')),
+        yaxis=dict(title_font=dict(size=16, color='black'), tickfont=dict(size=12, color='black')),
     )
     return fig
 
@@ -450,7 +465,7 @@ def main():
         st.markdown('<div class="sub-header">Buscar Películas Similares</div>', unsafe_allow_html=True)
         col1, col2 = st.columns([1, 1])
 
-        # ------------ CAMBIOS AQUÍ (búsqueda por teclado, multi-selección y previsualización) ------------
+        # ------------ Opción 1: Selección desde la base ------------
         with col1:
             st.markdown("#### Opción 1: Seleccionar de la Base de Datos")
 
@@ -493,7 +508,7 @@ def main():
                 selected_movies = [selected_movie] if selected_movie else []
                 has_selection = bool(selected_movie)
 
-            # 4) Previsualización de la(s) película(s) base con póster
+            # 4) Previsualización
             if has_selection:
                 st.markdown("### Película(s) base")
                 cols_prev = st.columns(min(3, len(selected_movies)))
@@ -504,7 +519,7 @@ def main():
                         display_movie_card(mrow, show_similarity=False)
                         st.markdown('</div>', unsafe_allow_html=True)
 
-            # 5) Buscar similares (usa el universo candidato filtrado arriba)
+            # 5) Buscar similares
             if st.button("Buscar Similares", key="btn_search_db"):
                 if not has_selection:
                     st.warning("Selecciona al menos una película.")
@@ -512,12 +527,11 @@ def main():
 
                 candidate_df = search_df.copy()
 
-                # Vector de consulta: promedio de features si hay varias
                 base_rows = df[df['title'].isin(selected_movies)]
                 query_matrix = base_rows[feature_cols].values
                 query_features = query_matrix.mean(axis=0)
 
-                # Excluir del resultado las películas base (si hay movieId)
+                # Excluir base del resultado si hay movieId
                 if 'movieId' in candidate_df.columns and 'movieId' in base_rows.columns:
                     base_ids = set(base_rows['movieId'].tolist())
                     candidate_df = candidate_df[~candidate_df['movieId'].isin(base_ids)]
@@ -535,8 +549,8 @@ def main():
                         st.markdown('<div class="movie-card">', unsafe_allow_html=True)
                         display_movie_card(movie, show_similarity=True)
                         st.markdown('</div>', unsafe_allow_html=True)
-        # ------------ FIN DE CAMBIOS ------------
 
+        # ------------ Opción 2: Imagen subida ------------
         with col2:
             st.markdown("####  Opción 2: Subir una Imagen")
             st.info("⚠️ DEMO: usa el mismo pipeline de features que tu entrenamiento para resultados reales.")
@@ -593,7 +607,7 @@ def main():
     # ===== Tab 3: Visualización 2D =====
     with tab3:
         st.markdown('<div class="sub-header">Visualización del Espacio de Características</div>', unsafe_allow_html=True)
-        st.info("Esta visualización muestra la distribución de películas en un espacio 2D. Películas cercanas tienen características visuales similares.")
+        st.info("Esta visualización muestra la distribución de películas en un espacio 2D usando columnas reales (elige X e Y).")
 
         col1, col2 = st.columns([3, 1])
         with col2:
@@ -607,6 +621,7 @@ def main():
                 plot_df = df
 
         with col1:
+            # Color
             if color_option == "Cluster":
                 color_by = 'cluster'
             elif color_option == "Año (si disponible)" and 'year' in df.columns:
@@ -618,7 +633,24 @@ def main():
             else:
                 color_by = 'cluster'
 
-            fig_scatter = plot_clusters_interactive(plot_df, feature_cols, color_by)
+            # Selectores de ejes
+            numeric_cols = plot_df.select_dtypes(include=[np.number]).columns.tolist()
+            # Sugerencias por defecto
+            default_x = feature_cols[0] if feature_cols else (numeric_cols[0] if numeric_cols else None)
+            default_y = feature_cols[1] if len(feature_cols) > 1 else (numeric_cols[1] if len(numeric_cols) > 1 else None)
+
+            st.markdown("#### Elegir columnas para los ejes")
+            cxa, cya = st.columns(2)
+            with cxa:
+                x_col = st.selectbox("Eje X", options=numeric_cols,
+                                     index=max(0, numeric_cols.index(default_x)) if default_x in numeric_cols else 0,
+                                     key="ax_x")
+            with cya:
+                y_col = st.selectbox("Eje Y", options=numeric_cols,
+                                     index=max(1, numeric_cols.index(default_y)) if default_y in numeric_cols else (1 if len(numeric_cols) > 1 else 0),
+                                     key="ax_y")
+
+            fig_scatter = plot_scatter_by_columns(plot_df, x_col, y_col, color_by, title_suffix=method)
             st.plotly_chart(fig_scatter, use_container_width=True, key="plot_scatter_main")
 
         st.markdown("### Análisis Estadístico")
@@ -691,6 +723,7 @@ def main():
 
                 if len(filtered_df) > (n_cols * max_rows):
                     st.info(f"Mostrando las primeras {n_cols * max_rows} de {len(filtered_df)} películas")
+
             elif view_option == "Tabla":
                 display_cols = ['cluster']
                 for c in ['title', 'genres', 'year', 'movieId']:
@@ -699,9 +732,24 @@ def main():
                 st.dataframe(filtered_df[display_cols].head(200), use_container_width=True, height=420)
                 csv = filtered_df.to_csv(index=False)
                 st.download_button("Descargar resultados (CSV)", data=csv, file_name="peliculas_filtradas.csv", mime="text/csv")
+
             else:
-                fig = plot_clusters_interactive(filtered_df, feature_cols, 'cluster')
-                st.plotly_chart(fig, use_container_width=True, key="plot_filtered_scatter")
+                # Gráfico con ejes elegibles también en esta pestaña
+                st.markdown("#### Gráfico de dispersión de los filtrados")
+                numeric_cols_f = filtered_df.select_dtypes(include=[np.number]).columns.tolist()
+                if len(numeric_cols_f) >= 2:
+                    cx, cy = st.columns(2)
+                    with cx:
+                        x_f = st.selectbox("Eje X (filtrados)", options=numeric_cols_f, key="flt_x")
+                    with cy:
+                        # elegir distinta de x_f si se puede
+                        default_y_idx = 1 if numeric_cols_f[0] == x_f and len(numeric_cols_f) > 1 else 0
+                        y_f = st.selectbox("Eje Y (filtrados)", options=[c for c in numeric_cols_f if c != x_f] or numeric_cols_f,
+                                           index=default_y_idx, key="flt_y")
+                    fig = plot_scatter_by_columns(filtered_df, x_f, y_f, color_by='cluster', title_suffix=method)
+                    st.plotly_chart(fig, use_container_width=True, key="plot_filtered_scatter")
+                else:
+                    st.info("No hay suficientes columnas numéricas para graficar.")
         else:
             st.warning("No se encontraron películas con los filtros seleccionados")
 
